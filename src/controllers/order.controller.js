@@ -6,116 +6,173 @@ import { Payment } from '../models/Payment.js';
 import { badRequest, notFound } from '../utils/errors.js';
 import { parseQuery } from '../utils/pagination.js';
 import { emailQueue, orderQueue } from '../jobs/queue.js';
+import { env } from '../config/env.js';
 import { ORDER_STATUS } from '../utils/constants.js';
 
 const PAYMENT_DEADLINE_MIN = 15;
 
 export async function checkout(req, res, next) {
-  const session = await mongoose.startSession();
+  let session = null;
   try {
-    session.startTransaction();
+    // Allow config flag to explicitly disable transactions in dev
+    if (!env.disableTransactions) {
+      // Detect whether the connected MongoDB topology supports transactions (replica set / sharded).
+      const topologyType = (mongoose.connection && mongoose.connection.client && mongoose.connection.client.topology && mongoose.connection.client.topology.description && mongoose.connection.client.topology.description.type) || '';
+      const supportsTransactions = String(topologyType).toLowerCase().includes('replicaset') || String(topologyType).toLowerCase().includes('sharded');
+      const forceTx = process.env.FORCE_TRANSACTIONS === 'true';
+      if (supportsTransactions || forceTx) {
+        session = await mongoose.startSession();
+        try { session.startTransaction(); } catch (txErr) { console.warn('Transactions unavailable, proceeding without transaction:', txErr && txErr.message); session = null; }
+      } else {
+        session = null;
+      }
+    }
     const cart = await Cart.findOne({ userId: req.user.id }).lean();
     if (!cart || cart.items.length === 0) throw badRequest('Cart is empty');
 
-    const products = await Product.find({ _id: { $in: cart.items.map(i => i.productId) } }).session(session);
+    const productsQuery = Product.find({ _id: { $in: cart.items.map(i => i.productId) } });
+    const products = session ? await productsQuery.session(session) : await productsQuery;
     const priceMap = new Map(products.map(p => [p._id.toString(), p.price]));
 
     for (const item of cart.items) {
       const price = priceMap.get(item.productId.toString());
       if (price == null) throw badRequest('Invalid product in cart');
-      const resv = await Product.updateOne(
+      const updQuery = Product.updateOne(
         { _id: item.productId, $expr: { $gte: [{ $subtract: ['$totalStock', '$reservedStock'] }, item.quantity] } },
         { $inc: { reservedStock: item.quantity } }
-      ).session(session);
-      if (resv.modifiedCount !== 1) throw badRequest('Insufficient stock');
+      );
+      const resv = session ? await updQuery.session(session) : await updQuery;
+      if (!resv || resv.modifiedCount !== 1) throw badRequest('Insufficient stock');
     }
 
     const items = cart.items.map(i => ({ productId: i.productId, quantity: i.quantity, priceAtPurchase: priceMap.get(i.productId.toString()) }));
     const totalAmount = items.reduce((sum, i) => sum + i.quantity * i.priceAtPurchase, 0);
 
     const expiresAt = new Date(Date.now() + PAYMENT_DEADLINE_MIN * 60 * 1000);
-    const [order] = await Order.create([{ userId: req.user.id, items, totalAmount, status: ORDER_STATUS.PENDING_PAYMENT, expiresAt }], { session });
+    let order;
+    if (session) {
+      [order] = await Order.create([{ userId: req.user.id, items, totalAmount, status: ORDER_STATUS.PENDING_PAYMENT, expiresAt }], { session });
+      await session.commitTransaction();
+      session.endSession();
+    } else {
+      order = (await Order.create({ userId: req.user.id, items, totalAmount, status: ORDER_STATUS.PENDING_PAYMENT, expiresAt }));
+    }
 
-    await session.commitTransaction();
-    session.endSession();
-
-    await orderQueue.add('cancelUnpaid', { orderId: order._id.toString() }, { delay: PAYMENT_DEADLINE_MIN * 60 * 1000, jobId: order._id.toString(), removeOnComplete: true, removeOnFail: true });
+    try {
+      await orderQueue.add('cancelUnpaid', { orderId: order._id.toString() }, { delay: PAYMENT_DEADLINE_MIN * 60 * 1000, jobId: order._id.toString(), removeOnComplete: true, removeOnFail: true });
+    } catch (qErr) {
+      // don't fail the entire request if queueing fails (e.g., Redis not available). Log and continue.
+      console.error('Failed to schedule cancelUnpaid job:', qErr && qErr.message ? qErr.message : qErr);
+    }
 
     res.status(201).json(order);
   } catch (e) {
-    await session.abortTransaction();
-    session.endSession();
+    try { if (session) { await session.abortTransaction(); session.endSession(); } } catch (ee) { /* ignore */ }
     next(e);
   }
 }
 
 export async function pay(req, res, next) {
-  const session = await mongoose.startSession();
+  let session = null;
   try {
-    session.startTransaction();
+    // Respect env flag to disable transactions in local dev
+    if (!env.disableTransactions) {
+      const topologyType = (mongoose.connection && mongoose.connection.client && mongoose.connection.client.topology && mongoose.connection.client.topology.description && mongoose.connection.client.topology.description.type) || '';
+      const supportsTransactions = String(topologyType).toLowerCase().includes('replicaset') || String(topologyType).toLowerCase().includes('sharded');
+      const forceTx = process.env.FORCE_TRANSACTIONS === 'true';
+      if (supportsTransactions || forceTx) {
+        session = await mongoose.startSession();
+        try { session.startTransaction(); } catch (txErr) { console.warn('Transactions unavailable, proceeding without transaction:', txErr && txErr.message); session = null; }
+      } else {
+        session = null;
+      }
+    }
     const { id } = req.validated.params;
-    const { mockTransactionId } = req.validated.body;
+    const mockTransactionId = req.validated.body.mockTransactionId || req.validated.body.transactionId;
 
-    const order = await Order.findOne({ _id: id, userId: req.user.id }).session(session);
+    const orderQuery = Order.findOne({ _id: id, userId: req.user.id });
+    const order = session ? await orderQuery.session(session) : await orderQuery;
     if (!order) throw notFound('Order not found');
     if (order.status !== ORDER_STATUS.PENDING_PAYMENT) throw badRequest('Order is not payable');
 
     for (const item of order.items) {
-      const upd = await Product.updateOne(
+      const updQuery = Product.updateOne(
         { _id: item.productId, reservedStock: { $gte: item.quantity } },
         { $inc: { reservedStock: -item.quantity, totalStock: -item.quantity } }
-      ).session(session);
-      if (upd.modifiedCount !== 1) throw badRequest('Stock finalization failed');
+      );
+      const upd = session ? await updQuery.session(session) : await updQuery;
+      if (!upd || upd.modifiedCount !== 1) throw badRequest('Stock finalization failed');
     }
 
     order.status = ORDER_STATUS.PAID;
-    await order.save({ session });
+    if (session) {
+      await order.save({ session });
+      await Payment.create([{ orderId: order._id, transactionId: mockTransactionId, amount: order.totalAmount, status: 'SUCCESS' }], { session });
+      await Cart.updateOne({ userId: req.user.id }, { $set: { items: [] } }).session(session);
+      await session.commitTransaction();
+      session.endSession();
+    } else {
+      await order.save();
+      await Payment.create({ orderId: order._id, transactionId: mockTransactionId, amount: order.totalAmount, status: 'SUCCESS' });
+      await Cart.updateOne({ userId: req.user.id }, { $set: { items: [] } });
+    }
 
-    await Payment.create([{ orderId: order._id, transactionId: mockTransactionId, amount: order.totalAmount, status: 'SUCCESS' }], { session });
+    try {
+      const job = await orderQueue.getJob(order._id.toString());
+      if (job) await job.remove();
+    } catch (qErr) {
+      console.error('Failed to remove order cancellation job:', qErr && qErr.message ? qErr.message : qErr);
+    }
 
-    await Cart.updateOne({ userId: req.user.id }, { $set: { items: [] } }).session(session);
-
-    await session.commitTransaction();
-    session.endSession();
-
-    const job = await orderQueue.getJob(order._id.toString());
-    if (job) await job.remove();
-
-    await emailQueue.add('orderConfirmation', { to: req.user.email, subject: `Order ${order._id} confirmed`, html: `<p>Thanks ${req.user.name}! Your order is confirmed. Total: ${order.totalAmount}</p>` }, { removeOnComplete: true, removeOnFail: true });
+    try {
+      await emailQueue.add('orderConfirmation', { to: req.user.email, subject: `Order ${order._id} confirmed`, html: `<p>Thanks ${req.user.name}! Your order is confirmed. Total: ${order.totalAmount}</p>` }, { removeOnComplete: true, removeOnFail: true });
+    } catch (qErr) {
+      console.error('Failed to enqueue order confirmation email:', qErr && qErr.message ? qErr.message : qErr);
+    }
 
     res.json({ ok: true, order });
   } catch (e) {
-    await session.abortTransaction();
-    session.endSession();
+    try { if (session) { await session.abortTransaction(); session.endSession(); } } catch (ee) { /* ignore */ }
     next(e);
   }
 }
 
 export async function cancelIfUnpaid(orderId) {
-  const session = await mongoose.startSession();
+  let session = null;
   try {
-    session.startTransaction();
-    const order = await Order.findById(orderId).session(session);
-    if (!order) { await session.abortTransaction(); return; }
-    if (order.status !== ORDER_STATUS.PENDING_PAYMENT) { await session.commitTransaction(); return; }
+    // Respect env flag to disable transactions in local dev
+    if (!env.disableTransactions) {
+      const topologyType = (mongoose.connection && mongoose.connection.client && mongoose.connection.client.topology && mongoose.connection.client.topology.description && mongoose.connection.client.topology.description.type) || '';
+      const supportsTransactions = String(topologyType).toLowerCase().includes('replicaset') || String(topologyType).toLowerCase().includes('sharded');
+      const forceTx = process.env.FORCE_TRANSACTIONS === 'true';
+      if (supportsTransactions || forceTx) {
+        session = await mongoose.startSession();
+        try { session.startTransaction(); } catch (txErr) { console.warn('Transactions unavailable, proceeding without transaction:', txErr && txErr.message); session = null; }
+      } else {
+        session = null;
+      }
+    }
+    const orderQuery = Order.findById(orderId);
+    const order = session ? await orderQuery.session(session) : await orderQuery;
+    if (!order) { if (session) { await session.abortTransaction(); session.endSession(); } return; }
+    if (order.status !== ORDER_STATUS.PENDING_PAYMENT) { if (session) { await session.commitTransaction(); session.endSession(); } return; }
 
     for (const item of order.items) {
-      const upd = await Product.updateOne(
+      const updQuery = Product.updateOne(
         { _id: item.productId, reservedStock: { $gte: item.quantity } },
         { $inc: { reservedStock: -item.quantity } }
-      ).session(session);
-      if (upd.modifiedCount !== 1) throw new Error('Reservation release failed');
+      );
+      const upd = session ? await updQuery.session(session) : await updQuery;
+      if (!upd || upd.modifiedCount !== 1) throw new Error('Reservation release failed');
     }
 
     order.status = ORDER_STATUS.CANCELLED;
-    await order.save({ session });
+    if (session) await order.save({ session }); else await order.save();
 
-    await session.commitTransaction();
+    if (session) { await session.commitTransaction(); session.endSession(); }
   } catch (e) {
-    await session.abortTransaction();
+    try { if (session) { await session.abortTransaction(); session.endSession(); } } catch (ee) { /* ignore */ }
     throw e;
-  } finally {
-    session.endSession();
   }
 }
 
